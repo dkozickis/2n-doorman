@@ -16,6 +16,12 @@ const svc = (hass, service, data = {}, entryId = null) => {
   return hass.callService("doorman", service, d);
 };
 
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 function formatDate(ts) {
   if (!ts) return "Always";
   return new Date(ts * 1000).toLocaleDateString(undefined, {
@@ -251,6 +257,8 @@ class DoormanUsersTab extends HTMLElement {
     this._sortKey = "name";
     this._sortAsc = true;
     this._entryId = null;
+    this._syncRole = "none";
+    this._leaderName = null;
   }
 
   set hass(h) {
@@ -259,6 +267,10 @@ class DoormanUsersTab extends HTMLElement {
   }
 
   set entryId(id) { this._entryId = id; }
+  set syncRole(r) { this._syncRole = r || "none"; }
+  set leaderName(n) { this._leaderName = n; }
+
+  get _isFollower() { return this._syncRole === "follower"; }
 
   connectedCallback() { this._load(); }
 
@@ -348,10 +360,23 @@ class DoormanUsersTab extends HTMLElement {
         .perm-warning svg { flex-shrink: 0; margin-top: 1px; }
         th.sortable:hover { color: var(--primary-color); }
         th.sort-active { color: var(--primary-color); }
+        .follower-banner {
+          display: flex; align-items: center; gap: 10px;
+          padding: 12px 16px; margin-bottom: 16px;
+          background: rgba(33, 150, 243, 0.06); border: 1px solid rgba(33, 150, 243, 0.25);
+          border-radius: 8px; font-size: 13px; color: var(--primary-text-color);
+        }
+        .follower-banner svg { flex-shrink: 0; fill: var(--info-color, #2196f3); }
       </style>
+      ${this._isFollower ? `
+        <div class="follower-banner">
+          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z"/></svg>
+          <span>This device is a <strong>follower</strong>. The user directory is synced from <strong>${esc(this._leaderName || "the leader device")}</strong> and is read-only. To add, edit, or remove users, switch to the leader.</span>
+        </div>
+      ` : ""}
       <div class="toolbar">
         <h2>Directory Users</h2>
-        ${this._writePermission ? `
+        ${this._writePermission && !this._isFollower ? `
           <button class="btn btn-primary" id="add-btn">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M19 13H13V19H11V13H5V11H11V5H13V11H19V13Z"/></svg>
             Add User
@@ -432,7 +457,7 @@ class DoormanUsersTab extends HTMLElement {
               <path d="M21,19V20H3V19L5,17V11C5,7.9 7.03,5.17 10,4.29C10,4.19 10,4.1 10,4A2,2 0 0,1 12,2A2,2 0 0,1 14,4C14,4.1 14,4.19 14,4.29C16.97,5.17 19,7.9 19,11V17L21,19M14,21A2,2 0 0,1 12,23A2,2 0 0,1 10,21"/>
             </svg>
           </th>
-          <th></th>
+          ${this._isFollower ? "" : "<th></th>"}
         </tr>
       </thead>
       <tbody>
@@ -460,7 +485,7 @@ class DoormanUsersTab extends HTMLElement {
                 <path d="M21,19V20H3V19L5,17V11C5,7.9 7.03,5.17 10,4.29C10,4.19 10,4.1 10,4A2,2 0 0,1 12,2A2,2 0 0,1 14,4C14,4.1 14,4.19 14,4.29C16.97,5.17 19,7.9 19,11V17L21,19M14,21A2,2 0 0,1 12,23A2,2 0 0,1 10,21"/>
               </svg>
             </td>
-            <td class="actions">
+            ${this._isFollower ? "" : `<td class="actions">
               ${this._writePermission ? `
               <button class="icon-btn edit-btn" data-uuid="${u.uuid}" title="Edit">
                 <svg viewBox="0 0 24 24"><path d="M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z"/></svg>
@@ -468,7 +493,7 @@ class DoormanUsersTab extends HTMLElement {
               <button class="icon-btn del-btn" data-uuid="${u.uuid}" title="Delete">
                 <svg viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z"/></svg>
               </button>` : ``}
-            </td>
+            </td>`}
           </tr>
           `;
         }).join("")}
@@ -1038,6 +1063,17 @@ class DoormanPanel extends HTMLElement {
     const el = document.createElement(tagMap[this._tab]);
     if (this._hass) el.hass = this._hass;
     if (this._selectedEntryId) el.entryId = this._selectedEntryId;
+    // Pass sync info to users tab
+    if (this._tab === "users") {
+      const dev = this._devices.find(d => d.entry_id === this._selectedEntryId);
+      if (dev) {
+        el.syncRole = dev.sync_role;
+        if (dev.sync_role === "follower" && dev.sync_target) {
+          const leader = this._devices.find(d => d.entry_id === dev.sync_target);
+          el.leaderName = leader ? (leader.device_name || leader.serial_number) : null;
+        }
+      }
+    }
     container.appendChild(el);
   }
 }

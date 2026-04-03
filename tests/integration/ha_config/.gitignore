@@ -1,0 +1,5 @@
+# HA runtime state — only configuration.yaml is tracked
+*
+!.gitignore
+!configuration.yaml
+!blueprints/

@@ -21,3 +21,11 @@ STORAGE_KEY = f"{DOMAIN}.storage"
 STORAGE_VERSION = 1
 
 PLATFORMS = ["sensor", "switch", "event"]
+
+# ── Sync roles ──────────────────────────────────────────────────────────────
+CONF_SYNC_ROLE = "sync_role"
+CONF_SYNC_TARGET = "sync_target"
+
+SYNC_ROLE_NONE = "none"
+SYNC_ROLE_LEADER = "leader"
+SYNC_ROLE_FOLLOWER = "follower"
