@@ -169,20 +169,20 @@ async def test_update_user_on_leader_syncs_to_follower(
     # Wait for it to sync to follower
     await mock_2n_follower.wait_for_user("Update Test", timeout=90)
 
-    # Now update the user's PIN on the leader
+    # Now update the user's name on the leader
     leader_user = await mock_2n.get_user_by_name("Update Test")
     assert leader_user is not None
     await ha.call_service("doorman", "update_user", {
         "uuid": leader_user["uuid"],
-        "pin": "9999",
+        "name": "Update Test Renamed",
         "device": leader_entry["entry_id"],
     })
 
-    # Wait for the updated PIN to appear on follower
+    # Wait for the updated name to appear on follower
     follower_user = await mock_2n_follower.wait_for_user_field(
-        "Update Test", "pin", "9999", timeout=90,
+        "Update Test Renamed", "name", "Update Test Renamed", timeout=90,
     )
-    assert follower_user["pin"] == "9999"
+    assert follower_user["name"] == "Update Test Renamed"
 
 
 # ─── Delete propagation ────────────────────────────────────────────────────

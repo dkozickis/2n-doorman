@@ -7,35 +7,49 @@ via the /admin/* endpoints.
 from __future__ import annotations
 
 import copy
+import os
 import uuid as _uuid
 
 from aiohttp import web
 
+# ─── Device identity (configurable via env for multi-device testing) ─────────
+
+_DEVICE_NAME = os.environ.get("DEVICE_NAME", "2N IP Verso (Test)")
+_SERIAL_NUMBER = os.environ.get("SERIAL_NUMBER", "10-99999999")
+_HW_VERSION = os.environ.get("HW_VERSION", "535v1")
+_INITIAL_USER = os.environ.get("INITIAL_USER_NAME", "Test User")
+_INITIAL_UUID = os.environ.get("INITIAL_USER_UUID", "uuid-test-01")
+
 # ─── Mutable device state ────────────────────────────────────────────────────
 
-_state: dict = {
-    "device_info": {
-        "deviceName": "2N IP Verso (Test)",
-        "swVersion": "2.49.0.38",
-        "serialNumber": "10-99999999",
-        "hwVersion": "535v1",
-    },
-    "users": [
-        {
-            "uuid": "uuid-test-01",
-            "name": "Test User",
-            "pin": "1234",
-            "card": ["AABBCCDD"],
-            "code": [],
-            "validFrom": None,
-            "validTo": None,
-        }
-    ],
-    "switches": [
-        {"id": 1, "name": "Main Door", "active": False},
-    ],
-    "call_log": [],  # {"method", "path", "body"}
-}
+
+def _default_state() -> dict:
+    return {
+        "device_info": {
+            "deviceName": _DEVICE_NAME,
+            "swVersion": "2.49.0.38",
+            "serialNumber": _SERIAL_NUMBER,
+            "hwVersion": _HW_VERSION,
+        },
+        "users": [
+            {
+                "uuid": _INITIAL_UUID,
+                "name": _INITIAL_USER,
+                "pin": "1234",
+                "card": ["AABBCCDD"],
+                "code": [],
+                "validFrom": None,
+                "validTo": None,
+            }
+        ],
+        "switches": [
+            {"id": 1, "name": "Main Door", "active": False},
+        ],
+        "call_log": [],
+    }
+
+
+_state: dict = _default_state()
 
 
 def _log(method: str, path: str, body=None) -> None:
@@ -131,19 +145,11 @@ async def admin_get_calls(request: web.Request) -> web.Response:
 
 async def admin_reset(request: web.Request) -> web.Response:
     """Reset call log and restore initial device state."""
-    _state["call_log"].clear()
-    _state["users"] = [
-        {
-            "uuid": "uuid-test-01",
-            "name": "Test User",
-            "pin": "1234",
-            "card": ["AABBCCDD"],
-            "code": [],
-            "validFrom": None,
-            "validTo": None,
-        }
-    ]
-    _state["switches"] = [{"id": 1, "name": "Main Door", "active": False}]
+    fresh = _default_state()
+    _state["call_log"] = fresh["call_log"]
+    _state["users"] = fresh["users"]
+    _state["switches"] = fresh["switches"]
+    # Keep device_info unchanged (set at startup from env vars)
     return web.json_response({"ok": True})
 
 
