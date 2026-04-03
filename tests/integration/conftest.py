@@ -106,7 +106,8 @@ def socket_enabled():
 
 
 @pytest.fixture(autouse=True)
-async def reset_mock_2n(mock_2n: Mock2nAdmin):
-    """Reset mock server state before each test so tests are independent."""
+async def reset_mock_2n(mock_2n: Mock2nAdmin, mock_2n_follower: Mock2nAdmin):
+    """Reset both mock server states before each test so tests are independent."""
     await mock_2n.reset()
+    await mock_2n_follower.reset()
     yield

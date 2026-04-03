@@ -177,6 +177,11 @@ class Mock2nAdmin:
         """Filter calls synchronously (after fetching with get_calls)."""
         raise NotImplementedError("Use async get_calls() then filter")
 
+    async def get_user_by_name(self, name: str) -> dict | None:
+        """Return the first user with the given name, or None."""
+        users = await self.get_users()
+        return next((u for u in users if u.get("name") == name), None)
+
     async def wait_for_user(
         self, user_name: str, timeout: float = 60.0, interval: float = 2.0
     ) -> dict:
@@ -189,6 +194,33 @@ class Mock2nAdmin:
                     return u
             await asyncio.sleep(interval)
         raise TimeoutError(f"User {user_name!r} not found on device after {timeout}s")
+
+    async def wait_for_user_gone(
+        self, user_name: str, timeout: float = 60.0, interval: float = 2.0
+    ) -> bool:
+        """Poll until no user with the given name exists, or timeout."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            users = await self.get_users()
+            if not any(u.get("name") == user_name for u in users):
+                return True
+            await asyncio.sleep(interval)
+        raise TimeoutError(f"User {user_name!r} still present on device after {timeout}s")
+
+    async def wait_for_user_field(
+        self, user_name: str, field: str, expected: str,
+        timeout: float = 60.0, interval: float = 2.0,
+    ) -> dict:
+        """Poll until a user's field matches the expected value, or timeout."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            user = await self.get_user_by_name(user_name)
+            if user and user.get(field) == expected:
+                return user
+            await asyncio.sleep(interval)
+        raise TimeoutError(
+            f"User {user_name!r} field {field!r} did not reach {expected!r} within {timeout}s"
+        )
 
     async def wait_for_user_count(
         self, count: int, timeout: float = 60.0, interval: float = 2.0
