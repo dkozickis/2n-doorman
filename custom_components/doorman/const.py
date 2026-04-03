@@ -18,7 +18,7 @@ PANEL_TITLE = "Doorman"
 PANEL_ICON = "mdi:door-closed-lock"
 
 STORAGE_KEY = f"{DOMAIN}.storage"
-STORAGE_VERSION = 2
+STORAGE_VERSION = 1
 
 PLATFORMS = ["sensor", "switch", "event"]
 

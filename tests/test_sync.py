@@ -35,6 +35,7 @@ FOLLOWER_USERS = [
 
 LEADER_ENTRY_ID = "leader_entry_id"
 FOLLOWER_ENTRY_ID = "follower_entry_id"
+PAIR_ID = LEADER_ENTRY_ID
 
 
 def _make_coordinator(entry_id, users, device_info=None):
@@ -94,10 +95,11 @@ async def test_initial_reconcile_matches_by_name(hass: HomeAssistant, store) -> 
     _make_entries(hass, leader, follower)
 
     sync = UserSyncManager(hass, store)
-    await sync._initial_reconcile(leader, follower)
+    await sync._initial_reconcile(leader, follower, PAIR_ID)
 
     # Alice matched by name → mapping created
-    assert store.sync_mappings.get("L1") == "F1"
+    pair_mappings = store.sync_mappings_for(PAIR_ID)
+    assert pair_mappings.get("L1") == "F1"
     # Alice's PIN updated from leader ("1111") since follower had "0000"
     follower.client.update_user.assert_called_once()
     update_call = follower.client.update_user.call_args[0][0]
@@ -108,7 +110,7 @@ async def test_initial_reconcile_matches_by_name(hass: HomeAssistant, store) -> 
     follower.client.create_user.assert_called_once()
     create_call = follower.client.create_user.call_args[0][0]
     assert create_call["name"] == "Bob"
-    assert "L2" in store.sync_mappings
+    assert "L2" in pair_mappings
 
 
 @pytest.mark.asyncio
@@ -120,10 +122,10 @@ async def test_reconcile_creates_new_users(hass: HomeAssistant, store) -> None:
 
     sync = UserSyncManager(hass, store)
     sync._initialized = True
-    await sync._reconcile(leader, follower)
+    await sync._reconcile(leader, follower, PAIR_ID)
 
     assert follower.client.create_user.call_count == 2
-    assert len(store.sync_mappings) == 2
+    assert len(store.sync_mappings_for(PAIR_ID)) == 2
 
 
 @pytest.mark.asyncio
@@ -136,11 +138,11 @@ async def test_reconcile_updates_changed_fields(hass: HomeAssistant, store) -> N
     follower = _make_coordinator(FOLLOWER_ENTRY_ID, follower_users)
     _make_entries(hass, leader, follower)
 
-    store._data["sync_mappings"]["L1"] = "F1"
+    store._data["sync_mappings"][PAIR_ID] = {"L1": "F1"}
 
     sync = UserSyncManager(hass, store)
     sync._initialized = True
-    await sync._reconcile(leader, follower)
+    await sync._reconcile(leader, follower, PAIR_ID)
 
     follower.client.update_user.assert_called_once()
     update = follower.client.update_user.call_args[0][0]
@@ -158,14 +160,14 @@ async def test_reconcile_deletes_removed_users(hass: HomeAssistant, store) -> No
     follower = _make_coordinator(FOLLOWER_ENTRY_ID, follower_users)
     _make_entries(hass, leader, follower)
 
-    store._data["sync_mappings"]["L1"] = "F1"
+    store._data["sync_mappings"][PAIR_ID] = {"L1": "F1"}
 
     sync = UserSyncManager(hass, store)
     sync._initialized = True
-    await sync._reconcile(leader, follower)
+    await sync._reconcile(leader, follower, PAIR_ID)
 
     follower.client.delete_user.assert_called_once_with("F1")
-    assert "L1" not in store.sync_mappings
+    assert "L1" not in store.sync_mappings_for(PAIR_ID)
 
 
 @pytest.mark.asyncio
@@ -178,11 +180,11 @@ async def test_reconcile_no_changes_when_identical(hass: HomeAssistant, store) -
     follower = _make_coordinator(FOLLOWER_ENTRY_ID, follower_users)
     _make_entries(hass, leader, follower)
 
-    store._data["sync_mappings"]["L1"] = "F1"
+    store._data["sync_mappings"][PAIR_ID] = {"L1": "F1"}
 
     sync = UserSyncManager(hass, store)
     sync._initialized = True
-    await sync._reconcile(leader, follower)
+    await sync._reconcile(leader, follower, PAIR_ID)
 
     follower.client.create_user.assert_not_called()
     follower.client.update_user.assert_not_called()
@@ -200,7 +202,7 @@ async def test_unmanaged_follower_users_left_alone(hass: HomeAssistant, store) -
 
     sync = UserSyncManager(hass, store)
     sync._initialized = True
-    await sync._reconcile(leader, follower)
+    await sync._reconcile(leader, follower, PAIR_ID)
 
     follower.client.delete_user.assert_not_called()
 
@@ -213,12 +215,14 @@ async def test_reentrance_guard_skips_concurrent_sync(hass: HomeAssistant, store
     _make_entries(hass, leader, follower)
 
     sync = UserSyncManager(hass, store)
-    sync._syncing = True  # Simulate in-progress sync
+    # Acquire the lock to simulate in-progress sync
+    await sync._lock.acquire()
 
     await sync._on_leader_update(LEADER_ENTRY_ID, FOLLOWER_ENTRY_ID)
 
     # No API calls should have been made
     follower.client.create_user.assert_not_called()
+    sync._lock.release()
 
 
 @pytest.mark.asyncio
@@ -227,6 +231,20 @@ async def test_follower_offline_skips_gracefully(hass: HomeAssistant, store) -> 
     leader = _make_coordinator(LEADER_ENTRY_ID, LEADER_USERS)
     follower = _make_coordinator(FOLLOWER_ENTRY_ID, [])
     follower.data = None  # Simulate offline/error state
+    _make_entries(hass, leader, follower)
+
+    sync = UserSyncManager(hass, store)
+    await sync._on_leader_update(LEADER_ENTRY_ID, FOLLOWER_ENTRY_ID)
+
+    follower.client.create_user.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_leader_offline_skips_gracefully(hass: HomeAssistant, store) -> None:
+    """Sync is skipped when the leader coordinator has no data."""
+    leader = _make_coordinator(LEADER_ENTRY_ID, LEADER_USERS)
+    leader.data = None  # Simulate offline/error state
+    follower = _make_coordinator(FOLLOWER_ENTRY_ID, [])
     _make_entries(hass, leader, follower)
 
     sync = UserSyncManager(hass, store)
@@ -246,7 +264,7 @@ async def test_sync_error_does_not_crash(hass: HomeAssistant, store) -> None:
     sync = UserSyncManager(hass, store)
     sync._initialized = True
     # Should not raise
-    await sync._reconcile(leader, follower)
+    await sync._reconcile(leader, follower, PAIR_ID)
 
     # The sync should have attempted and failed gracefully
     assert follower.client.create_user.call_count >= 1
@@ -268,9 +286,95 @@ async def test_initial_reconcile_skips_duplicate_names(hass: HomeAssistant, stor
     _make_entries(hass, leader, follower)
 
     sync = UserSyncManager(hass, store)
-    await sync._initial_reconcile(leader, follower)
+    await sync._initial_reconcile(leader, follower, PAIR_ID)
 
     # Neither Alice should be mapped (ambiguous)
-    assert len(store.sync_mappings) == 0
+    assert len(store.sync_mappings_for(PAIR_ID)) == 0
     follower.client.update_user.assert_not_called()
     follower.client.create_user.assert_not_called()
+
+
+# ─── New tests for review fixes ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_delete_failure_preserves_mapping(hass: HomeAssistant, store) -> None:
+    """When delete_user fails, the sync mapping should NOT be removed (Fix 2)."""
+    leader = _make_coordinator(LEADER_ENTRY_ID, [])  # user removed from leader
+    follower_users = [{"uuid": "F1", "name": "Alice", "pin": "1111", "card": [], "code": [], "validFrom": None, "validTo": None}]
+    follower = _make_coordinator(FOLLOWER_ENTRY_ID, follower_users)
+    follower.client.delete_user = AsyncMock(side_effect=Exception("network error"))
+    _make_entries(hass, leader, follower)
+
+    store._data["sync_mappings"][PAIR_ID] = {"L1": "F1"}
+
+    sync = UserSyncManager(hass, store)
+    sync._initialized = True
+    await sync._reconcile(leader, follower, PAIR_ID)
+
+    # Mapping should still exist since delete failed
+    assert store.sync_mappings_for(PAIR_ID).get("L1") == "F1"
+
+
+@pytest.mark.asyncio
+async def test_empty_first_poll_defers_initial_reconcile(hass: HomeAssistant, store) -> None:
+    """If leader returns 0 users on first poll, _initialized stays False (Fix 13)."""
+    leader = _make_coordinator(LEADER_ENTRY_ID, [])  # empty
+    follower = _make_coordinator(FOLLOWER_ENTRY_ID, [])
+    _make_entries(hass, leader, follower)
+
+    sync = UserSyncManager(hass, store)
+    await sync._on_leader_update(LEADER_ENTRY_ID, FOLLOWER_ENTRY_ID)
+
+    assert not sync._initialized
+    follower.client.create_user.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_follower_mapping_removed(hass: HomeAssistant, store) -> None:
+    """Out-of-band follower deletion removes stale mapping (Fix 20)."""
+    leader_users = [{"uuid": "L1", "name": "Alice", "pin": "1111", "card": [], "code": [], "validFrom": None, "validTo": None}]
+    leader = _make_coordinator(LEADER_ENTRY_ID, leader_users)
+    # Follower has no users — F1 was deleted out-of-band
+    follower = _make_coordinator(FOLLOWER_ENTRY_ID, [])
+    _make_entries(hass, leader, follower)
+
+    store._data["sync_mappings"][PAIR_ID] = {"L1": "F1"}
+
+    sync = UserSyncManager(hass, store)
+    sync._initialized = True
+    await sync._reconcile(leader, follower, PAIR_ID)
+
+    # Stale mapping removed; next cycle will re-create
+    assert "L1" not in store.sync_mappings_for(PAIR_ID)
+
+
+@pytest.mark.asyncio
+async def test_async_setup_subscribes_listener(hass: HomeAssistant, store) -> None:
+    """async_setup registers a listener on the leader coordinator (Fix 18)."""
+    leader = _make_coordinator(LEADER_ENTRY_ID, LEADER_USERS)
+    follower = _make_coordinator(FOLLOWER_ENTRY_ID, FOLLOWER_USERS)
+    _make_entries(hass, leader, follower)
+
+    sync = UserSyncManager(hass, store)
+    sync.async_setup()
+
+    leader.async_add_listener.assert_called_once()
+    assert len(sync._listeners) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_teardown_unsubscribes(hass: HomeAssistant, store) -> None:
+    """async_teardown removes all listeners (Fix 18)."""
+    leader = _make_coordinator(LEADER_ENTRY_ID, LEADER_USERS)
+    follower = _make_coordinator(FOLLOWER_ENTRY_ID, FOLLOWER_USERS)
+    _make_entries(hass, leader, follower)
+
+    sync = UserSyncManager(hass, store)
+    sync.async_setup()
+    unsub_mock = leader.async_add_listener.return_value
+
+    sync.async_teardown()
+
+    unsub_mock.assert_called_once()
+    assert len(sync._listeners) == 0
+    assert not sync._initialized

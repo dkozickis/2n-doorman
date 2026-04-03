@@ -47,6 +47,9 @@ def ws_list_devices(
     msg: dict,
 ) -> None:
     """Return all configured Doorman device entries."""
+    if not connection.user.is_admin:
+        connection.send_error(msg["id"], "unauthorized", "Admin access required")
+        return
     entries: dict[str, DoormanCoordinator] = hass.data.get(DOMAIN, {})
     devices = []
     for entry_id, coord in entries.items():
@@ -89,6 +92,7 @@ def ws_list_users(
     store = _store(hass)
     links = store.user_links if store else {}
 
+    is_admin = connection.user.is_admin
     last_access = coordinator.data.get("last_access", {})
     users = []
     for user in coordinator.data.get("users", []):
@@ -99,12 +103,16 @@ def ws_list_users(
             leader_uuid = store.get_leader_uuid_for_follower(uuid)
             if leader_uuid:
                 lookup_uuid = leader_uuid
-        users.append({
+        entry = {
             **user,
             "ha_user_id": links.get(lookup_uuid),
             "notification_targets": store.get_notification_targets(lookup_uuid) if store else [],
             "last_access": last_access.get(uuid),
-        })
+        }
+        if not is_admin:
+            for key in ("pin", "card", "code"):
+                entry.pop(key, None)
+        users.append(entry)
     connection.send_result(msg["id"], {
         "users": users,
         "write_permission": coordinator.has_write_permission,

@@ -12,7 +12,9 @@ from homeassistant.helpers.storage import Store
 
 from .const import STORAGE_KEY, STORAGE_VERSION
 
-_EMPTY: dict = {"user_links": {}, "notification_targets": {}, "last_access": {}, "sync_mappings": {}}
+
+def _empty_data() -> dict:
+    return {"user_links": {}, "notification_targets": {}, "last_access": {}, "sync_mappings": {}}
 
 
 class DoormanStore:
@@ -20,18 +22,23 @@ class DoormanStore:
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        self._data: dict = dict(_EMPTY)
+        self._data: dict = _empty_data()
 
     async def async_load(self) -> None:
         """Load data from disk. Call once during integration setup."""
         stored = await self._store.async_load()
         if stored is None:
-            self._data = dict(_EMPTY)
+            self._data = _empty_data()
         else:
             self._data = stored
-            # Migrate from v1: add sync_mappings if missing
+            # Migrate: add sync_mappings if missing
             if "sync_mappings" not in self._data:
                 self._data["sync_mappings"] = {}
+                await self._store.async_save(self._data)
+            # Migrate: convert flat {uuid: uuid} to nested {pair_id: {uuid: uuid}}
+            sm = self._data.get("sync_mappings", {})
+            if sm and all(isinstance(v, str) for v in sm.values()):
+                self._data["sync_mappings"] = {"_migrated": sm}
                 await self._store.async_save(self._data)
 
     # ------------------------------------------------------------------ #
@@ -101,32 +108,49 @@ class DoormanStore:
         await self._store.async_save(self._data)
 
     # ------------------------------------------------------------------ #
-    # Sync mappings (leader UUID → follower UUID)                          #
+    # Sync mappings — scoped per sync pair                                 #
+    # Format: {leader_entry_id: {leader_uuid: follower_uuid}}              #
     # ------------------------------------------------------------------ #
 
-    @property
-    def sync_mappings(self) -> dict[str, str]:
-        """Return the full map of ``{leader_uuid: follower_uuid}``."""
-        return self._data.get("sync_mappings", {})
+    def sync_mappings_for(self, pair_id: str) -> dict[str, str]:
+        """Return ``{leader_uuid: follower_uuid}`` for a specific sync pair."""
+        return self._data.get("sync_mappings", {}).get(pair_id, {})
 
-    async def set_sync_mapping(self, leader_uuid: str, follower_uuid: str) -> None:
+    async def set_sync_mapping(
+        self, pair_id: str, leader_uuid: str, follower_uuid: str
+    ) -> None:
         """Store a leader→follower UUID mapping. Persists immediately."""
-        self._data.setdefault("sync_mappings", {})[leader_uuid] = follower_uuid
+        self._data.setdefault("sync_mappings", {}).setdefault(pair_id, {})[
+            leader_uuid
+        ] = follower_uuid
         await self._store.async_save(self._data)
 
-    async def remove_sync_mapping(self, leader_uuid: str) -> None:
-        """Remove a leader→follower UUID mapping. Persists immediately."""
-        self._data.get("sync_mappings", {}).pop(leader_uuid, None)
+    async def remove_sync_mapping(self, pair_id: str | None = None, leader_uuid: str = "") -> None:
+        """Remove a leader→follower UUID mapping. Persists immediately.
+
+        If ``pair_id`` is None, searches all pairs for the leader_uuid (for service-level cleanup).
+        """
+        sm = self._data.get("sync_mappings", {})
+        if pair_id is not None:
+            sm.get(pair_id, {}).pop(leader_uuid, None)
+        else:
+            for sub in sm.values():
+                sub.pop(leader_uuid, None)
         await self._store.async_save(self._data)
 
     def get_leader_uuid_for_follower(self, follower_uuid: str) -> str | None:
-        """Reverse lookup: return the leader UUID for a given follower UUID, or None."""
-        return next(
-            (lid for lid, fid in self.sync_mappings.items() if fid == follower_uuid),
-            None,
-        )
+        """Reverse lookup across all pairs: return the leader UUID for a follower UUID."""
+        for sub in self._data.get("sync_mappings", {}).values():
+            for lid, fid in sub.items():
+                if fid == follower_uuid:
+                    return lid
+        return None
 
-    async def clear_sync_mappings(self) -> None:
-        """Remove all sync mappings. Persists immediately."""
-        self._data["sync_mappings"] = {}
+    async def clear_sync_mappings(self, pair_id: str | None = None) -> None:
+        """Remove sync mappings. If pair_id given, only that pair; otherwise all."""
+        sm = self._data.get("sync_mappings", {})
+        if pair_id is not None:
+            sm.pop(pair_id, None)
+        else:
+            self._data["sync_mappings"] = {}
         await self._store.async_save(self._data)

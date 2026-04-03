@@ -40,6 +40,11 @@ from .storage import DoormanStore
 from .sync import UserSyncManager
 from .websocket import async_setup_websocket
 
+_FOLLOWER_WRITE_ERROR = (
+    "This device is configured as a sync follower. "
+    "User changes must be made on the leader device."
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -84,12 +89,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             notification_id=f"{DOMAIN}_no_write_permission_{entry.entry_id}",
         )
 
-    store = DoormanStore(hass)
-    await store.async_load()
+    if f"{DOMAIN}_store" not in hass.data:
+        store = DoormanStore(hass)
+        await store.async_load()
+        hass.data[f"{DOMAIN}_store"] = store
+    else:
+        store = hass.data[f"{DOMAIN}_store"]
     coordinator._last_access = dict(store.last_access)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    hass.data[f"{DOMAIN}_store"] = store
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -139,14 +147,16 @@ def _maybe_setup_sync(hass: HomeAssistant, store: DoormanStore) -> None:
     _teardown_sync(hass)
 
     entries = hass.data.get(DOMAIN, {})
+    has_pair = False
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry.options.get(CONF_SYNC_ROLE) == SYNC_ROLE_FOLLOWER:
             leader_entry_id = entry.options.get(CONF_SYNC_TARGET)
             if leader_entry_id and leader_entry_id in entries and entry.entry_id in entries:
-                sync_manager = UserSyncManager(hass, store)
-                sync_manager.async_setup()
-                hass.data[f"{DOMAIN}_sync"] = sync_manager
-                return
+                has_pair = True
+    if has_pair:
+        sync_manager = UserSyncManager(hass, store)
+        sync_manager.async_setup()
+        hass.data[f"{DOMAIN}_sync"] = sync_manager
 
 
 def _teardown_sync(hass: HomeAssistant) -> None:
@@ -174,18 +184,28 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 # Services                                                            #
 # ------------------------------------------------------------------ #
 
-def _resolve_coordinator(hass: HomeAssistant, call: ServiceCall) -> DoormanCoordinator:
-    """Return the coordinator for a service call, resolving the optional ``device`` field."""
+def _check_not_follower(hass: HomeAssistant, entry_id: str) -> None:
+    """Raise if the target device is a sync follower."""
+    entry = hass.config_entries.async_get_entry(entry_id)
+    if entry and entry.options.get(CONF_SYNC_ROLE) == SYNC_ROLE_FOLLOWER:
+        raise ServiceValidationError(_FOLLOWER_WRITE_ERROR)
+
+
+def _resolve_coordinator(
+    hass: HomeAssistant, call: ServiceCall
+) -> tuple[str, DoormanCoordinator]:
+    """Return (entry_id, coordinator) for a service call, resolving the optional ``device`` field."""
     entries: dict[str, DoormanCoordinator] = hass.data.get(DOMAIN, {})
     device = call.data.get("device")
     if device:
         if device not in entries:
             raise ServiceValidationError(f"Unknown Doorman device: {device}")
-        return entries[device]
+        return device, entries[device]
     if len(entries) == 0:
         raise ServiceValidationError("No Doorman devices are configured.")
     if len(entries) == 1:
-        return next(iter(entries.values()))
+        entry_id = next(iter(entries))
+        return entry_id, entries[entry_id]
     raise ServiceValidationError(
         "Multiple Doorman devices configured. Specify 'device' (config entry ID) to target one."
     )
@@ -197,7 +217,8 @@ def _register_services(hass: HomeAssistant) -> None:
         return
 
     async def handle_create_user(call: ServiceCall) -> None:
-        coordinator = _resolve_coordinator(hass, call)
+        entry_id, coordinator = _resolve_coordinator(hass, call)
+        _check_not_follower(hass, entry_id)
         user: dict = {"name": call.data["name"]}
         if "enabled" in call.data:
             user["enabled"] = call.data["enabled"]
@@ -215,7 +236,8 @@ def _register_services(hass: HomeAssistant) -> None:
         await coordinator.async_request_refresh()
 
     async def handle_update_user(call: ServiceCall) -> None:
-        coordinator = _resolve_coordinator(hass, call)
+        entry_id, coordinator = _resolve_coordinator(hass, call)
+        _check_not_follower(hass, entry_id)
         user: dict = {"uuid": call.data["uuid"]}
         for field in ("name", "pin"):
             if field in call.data and call.data[field]:
@@ -234,15 +256,22 @@ def _register_services(hass: HomeAssistant) -> None:
         await coordinator.async_request_refresh()
 
     async def handle_delete_user(call: ServiceCall) -> None:
-        coordinator = _resolve_coordinator(hass, call)
-        await coordinator.client.delete_user(call.data["uuid"])
+        entry_id, coordinator = _resolve_coordinator(hass, call)
+        _check_not_follower(hass, entry_id)
+        uuid = call.data["uuid"]
+        await coordinator.client.delete_user(uuid)
         store: DoormanStore | None = hass.data.get(f"{DOMAIN}_store")
         if store:
-            await store.unlink_user(call.data["uuid"])
+            await store.unlink_user(uuid)
+            await store.remove_sync_mapping(uuid)
+            # Also clean reverse mapping (if this was a follower user)
+            leader_uuid = store.get_leader_uuid_for_follower(uuid)
+            if leader_uuid:
+                await store.remove_sync_mapping(leader_uuid)
         await coordinator.async_request_refresh()
 
     async def handle_grant_access(call: ServiceCall) -> None:
-        coordinator = _resolve_coordinator(hass, call)
+        _, coordinator = _resolve_coordinator(hass, call)
         await coordinator.client.grant_access(
             access_point_id=call.data.get("access_point_id", 1),
             user_uuid=call.data.get("user_uuid"),

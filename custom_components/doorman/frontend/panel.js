@@ -16,6 +16,12 @@ const svc = (hass, service, data = {}, entryId = null) => {
   return hass.callService("doorman", service, d);
 };
 
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 function formatDate(ts) {
   if (!ts) return "Always";
   return new Date(ts * 1000).toLocaleDateString(undefined, {
@@ -357,7 +363,7 @@ class DoormanUsersTab extends HTMLElement {
         .follower-banner {
           display: flex; align-items: center; gap: 10px;
           padding: 12px 16px; margin-bottom: 16px;
-          background: var(--info-color, #2196f3)10; border: 1px solid var(--info-color, #2196f3)40;
+          background: rgba(33, 150, 243, 0.06); border: 1px solid rgba(33, 150, 243, 0.25);
           border-radius: 8px; font-size: 13px; color: var(--primary-text-color);
         }
         .follower-banner svg { flex-shrink: 0; fill: var(--info-color, #2196f3); }
@@ -365,7 +371,7 @@ class DoormanUsersTab extends HTMLElement {
       ${this._isFollower ? `
         <div class="follower-banner">
           <svg viewBox="0 0 24 24" width="20" height="20"><path d="M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z"/></svg>
-          <span>This device is a <strong>follower</strong>. The user directory is synced from <strong>${this._leaderName || "the leader device"}</strong> and is read-only. To add, edit, or remove users, switch to the leader.</span>
+          <span>This device is a <strong>follower</strong>. The user directory is synced from <strong>${esc(this._leaderName || "the leader device")}</strong> and is read-only. To add, edit, or remove users, switch to the leader.</span>
         </div>
       ` : ""}
       <div class="toolbar">
@@ -516,12 +522,6 @@ class DoormanUsersTab extends HTMLElement {
     table.querySelectorAll(".del-btn").forEach(btn => {
       btn.addEventListener("click", () => this._deleteUser(btn.dataset.uuid));
     });
-    table.querySelectorAll(".link-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const user = this._users.find(u => u.uuid === btn.dataset.uuid);
-        if (user) this._openLinkDrawer(user);
-      });
-    });
   }
 
   _buildUserForm(user = {}) {
@@ -662,73 +662,6 @@ class DoormanUsersTab extends HTMLElement {
           }
         }
         // Handle notification targets change
-        const notifyContainer = form.querySelector("#f-notify-targets");
-        if (notifyContainer) {
-          const selected = Array.from(notifyContainer.querySelectorAll("input[type=checkbox]:checked"))
-            .map(cb => cb.value);
-          const current = user.notification_targets || [];
-          const changed = selected.length !== current.length || selected.some(s => !current.includes(s));
-          if (changed) {
-            await ws(this._hass, "doorman/set_notification_targets", { two_n_uuid: user.uuid, targets: selected });
-          }
-        }
-        this._drawer.close();
-        this._load();
-      } catch (e) {
-        form.querySelector("#form-error").innerHTML = `<div class="error">${e.message}</div>`;
-      }
-    });
-  }
-
-  _openLinkDrawer(user) {
-    if (!this._drawer) {
-      this._drawer = document.createElement("doorman-drawer");
-      this.shadowRoot.appendChild(this._drawer);
-    }
-    const form = document.createElement("div");
-    form.innerHTML = `
-      <div class="field-group">
-        ${this._haUsers.length ? `
-          <div class="field">
-            <label>Link to HA user</label>
-            <select id="f-ha-user">
-              <option value="">— Not linked —</option>
-              ${this._haUsers.map(u => `<option value="${u.id}" ${user.ha_user_id === u.id ? "selected" : ""}>${u.name}</option>`).join("")}
-            </select>
-          </div>
-        ` : ""}
-        ${this._notifyServices.length ? `
-          <div class="section-title">Notifications</div>
-          <div class="field">
-            <label>Notify when this user opens the intercom</label>
-            <div id="f-notify-targets" style="display:flex;flex-direction:column;gap:6px;margin-top:4px">
-              ${this._notifyServices.map(svcName => {
-                const checked = (user.notification_targets || []).includes(svcName) ? "checked" : "";
-                const label = svcName.replace(/^notify\./, "");
-                return `<label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:normal;color:var(--primary-text-color);cursor:pointer">
-                  <input type="checkbox" value="${svcName}" ${checked} style="width:16px;height:16px;cursor:pointer" />
-                  ${label}
-                </label>`;
-              }).join("")}
-            </div>
-          </div>
-        ` : ""}
-        <div id="form-error"></div>
-      </div>
-    `;
-    this._drawer.open(`Settings: ${user.name || user.uuid}`, form, async () => {
-      try {
-        const haSelect = form.querySelector("#f-ha-user");
-        if (haSelect) {
-          const newHaId = haSelect.value;
-          if (newHaId !== (user.ha_user_id || "")) {
-            if (newHaId) {
-              await ws(this._hass, "doorman/link_user", { two_n_uuid: user.uuid, ha_user_id: newHaId });
-            } else {
-              await ws(this._hass, "doorman/unlink_user", { two_n_uuid: user.uuid });
-            }
-          }
-        }
         const notifyContainer = form.querySelector("#f-notify-targets");
         if (notifyContainer) {
           const selected = Array.from(notifyContainer.querySelectorAll("input[type=checkbox]:checked"))

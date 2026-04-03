@@ -6,6 +6,7 @@ on every successful leader poll cycle (~30 s).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import Counter
 from typing import Any
@@ -18,8 +19,16 @@ from .storage import DoormanStore
 
 _LOGGER = logging.getLogger(__name__)
 
-# Fields that are synced from leader → follower
+# Fields that are synced from leader → follower.
+# 'enabled' is intentionally excluded — per-device enable/disable is desired.
 _SYNC_FIELDS = ("name", "pin", "card", "code", "validFrom", "validTo")
+
+_SENSITIVE_FIELDS = frozenset({"pin", "card", "code"})
+
+
+def _redact_user(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a user payload with sensitive fields masked for logging."""
+    return {k: "***" if k in _SENSITIVE_FIELDS else v for k, v in payload.items()}
 
 
 class UserSyncManager:
@@ -29,7 +38,7 @@ class UserSyncManager:
         self._hass = hass
         self._store = store
         self._listeners: list[CALLBACK_TYPE] = []
-        self._syncing = False
+        self._lock = asyncio.Lock()
         self._initialized = False
 
     def async_setup(self) -> None:
@@ -41,7 +50,10 @@ class UserSyncManager:
                 continue
             unsub = leader_coord.async_add_listener(
                 lambda lid=leader_entry_id, fid=follower_entry_id: (
-                    self._hass.async_create_task(self._on_leader_update(lid, fid))
+                    self._hass.async_create_task(
+                        self._on_leader_update(lid, fid),
+                        name="doorman_sync_on_leader_update",
+                    )
                 )
             )
             self._listeners.append(unsub)
@@ -78,7 +90,7 @@ class UserSyncManager:
 
     async def _on_leader_update(self, leader_entry_id: str, follower_entry_id: str) -> None:
         """Called after the leader coordinator successfully polls."""
-        if self._syncing:
+        if self._lock.locked():
             _LOGGER.debug("Sync already in progress, skipping")
             return
 
@@ -87,27 +99,32 @@ class UserSyncManager:
         if leader is None or follower is None:
             return
 
-        # Skip if follower has no data yet (e.g. still in error state)
+        if leader.data is None:
+            _LOGGER.debug("Leader has no data yet, skipping sync")
+            return
         if follower.data is None:
             _LOGGER.debug("Follower has no data yet, skipping sync")
             return
 
-        self._syncing = True
-        try:
-            mappings = self._store.sync_mappings
-            if not mappings and not self._initialized:
-                await self._initial_reconcile(leader, follower)
-                self._initialized = True
-            else:
-                self._initialized = True
-                await self._reconcile(leader, follower)
-        except Exception:
-            _LOGGER.exception("Error during user sync")
-        finally:
-            self._syncing = False
+        pair_id = leader_entry_id
+        async with self._lock:
+            try:
+                mappings = self._store.sync_mappings_for(pair_id)
+                leader_users = leader.data.get("users", [])
+                if not mappings and not self._initialized:
+                    if not leader_users:
+                        _LOGGER.debug("Leader has no users yet, deferring initial reconcile")
+                        return
+                    await self._initial_reconcile(leader, follower, pair_id)
+                    self._initialized = True
+                else:
+                    self._initialized = True
+                    await self._reconcile(leader, follower, pair_id)
+            except Exception:
+                _LOGGER.exception("Error during user sync")
 
     async def _initial_reconcile(
-        self, leader: DoormanCoordinator, follower: DoormanCoordinator
+        self, leader: DoormanCoordinator, follower: DoormanCoordinator, pair_id: str
     ) -> None:
         """First-time setup: match users by name, build initial UUID mapping."""
         leader_users = leader.data.get("users", [])
@@ -140,7 +157,7 @@ class UserSyncManager:
             if fu:
                 # Match found — create mapping and update follower if needed
                 follower_uuid = fu.get("uuid")
-                await self._store.set_sync_mapping(leader_uuid, follower_uuid)
+                await self._store.set_sync_mapping(pair_id, leader_uuid, follower_uuid)
                 diff = self._compute_diff(lu, fu)
                 if diff:
                     diff["uuid"] = follower_uuid
@@ -154,11 +171,11 @@ class UserSyncManager:
                 # No match — create on follower
                 try:
                     payload = self._user_for_create(lu)
-                    _LOGGER.debug("Sync: creating user on follower: %s", payload)
+                    _LOGGER.debug("Sync: creating user on follower: %s", _redact_user(payload))
                     created = await follower.client.create_user(payload)
                     follower_uuid = created.get("uuid")
                     if follower_uuid:
-                        await self._store.set_sync_mapping(leader_uuid, follower_uuid)
+                        await self._store.set_sync_mapping(pair_id, leader_uuid, follower_uuid)
                     mutated = True
                     _LOGGER.info("Sync: created user '%s' on follower", name)
                 except Exception:
@@ -168,17 +185,18 @@ class UserSyncManager:
             await follower.async_request_refresh()
 
     async def _reconcile(
-        self, leader: DoormanCoordinator, follower: DoormanCoordinator
+        self, leader: DoormanCoordinator, follower: DoormanCoordinator, pair_id: str
     ) -> None:
         """Incremental sync: compare leader state vs mappings, apply changes."""
         leader_users = leader.data.get("users", [])
         follower_users = follower.data.get("users", [])
-        mappings = dict(self._store.sync_mappings)  # copy
+        mappings = dict(self._store.sync_mappings_for(pair_id))  # copy
 
         leader_by_uuid = {u["uuid"]: u for u in leader_users if "uuid" in u}
         follower_by_uuid = {u["uuid"]: u for u in follower_users if "uuid" in u}
 
         mutated = False
+        created_this_cycle: set[str] = set()
 
         # Creates: leader users not yet in mappings
         for leader_uuid, lu in leader_by_uuid.items():
@@ -186,12 +204,13 @@ class UserSyncManager:
                 continue
             try:
                 payload = self._user_for_create(lu)
-                _LOGGER.debug("Sync: creating user on follower: %s", payload)
+                _LOGGER.debug("Sync: creating user on follower: %s", _redact_user(payload))
                 created = await follower.client.create_user(payload)
                 follower_uuid = created.get("uuid")
                 if follower_uuid:
-                    await self._store.set_sync_mapping(leader_uuid, follower_uuid)
+                    await self._store.set_sync_mapping(pair_id, leader_uuid, follower_uuid)
                     mappings[leader_uuid] = follower_uuid
+                    created_this_cycle.add(leader_uuid)
                 mutated = True
                 _LOGGER.info("Sync: created user '%s' on follower", lu.get("name"))
             except Exception:
@@ -201,9 +220,22 @@ class UserSyncManager:
 
         # Updates: mapped users with changed fields
         for leader_uuid, follower_uuid in list(mappings.items()):
+            if leader_uuid in created_this_cycle:
+                continue
             lu = leader_by_uuid.get(leader_uuid)
+            if lu is None:
+                continue
             fu = follower_by_uuid.get(follower_uuid)
-            if lu is None or fu is None:
+            if fu is None:
+                # Follower user was deleted out-of-band — remove stale mapping
+                # so the next cycle re-creates the user
+                _LOGGER.warning(
+                    "Sync: follower user %s missing (out-of-band deletion?), "
+                    "removing stale mapping for leader %s",
+                    follower_uuid, leader_uuid,
+                )
+                await self._store.remove_sync_mapping(pair_id, leader_uuid)
+                del mappings[leader_uuid]
                 continue
             diff = self._compute_diff(lu, fu)
             if diff:
@@ -223,6 +255,7 @@ class UserSyncManager:
                 continue
             try:
                 await follower.client.delete_user(follower_uuid)
+                await self._store.remove_sync_mapping(pair_id, leader_uuid)
                 mutated = True
                 _LOGGER.info("Sync: deleted user (leader uuid=%s) from follower", leader_uuid)
             except Exception:
@@ -230,7 +263,6 @@ class UserSyncManager:
                     "Sync: failed to delete user (leader uuid=%s) from follower",
                     leader_uuid,
                 )
-            await self._store.remove_sync_mapping(leader_uuid)
 
         if mutated:
             await follower.async_request_refresh()
